@@ -1,10 +1,14 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 import httpx
 import os
 import re
+import csv
+import io
+import anthropic
 from dotenv import load_dotenv
 from datetime import datetime
 
@@ -12,6 +16,7 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -26,7 +31,7 @@ def get_client():
 app = FastAPI(
     title="PolicyThread",
     description="Define what your AI must always do and never do. PolicyThread watches every live interaction and tells you when it breaks the rules.",
-    version="0.1.0"
+    version="0.3.0"
 )
 
 app.add_middleware(
@@ -63,9 +68,9 @@ class InteractionSubmit(BaseModel):
 class BatchSubmit(BaseModel):
     interactions: List[InteractionSubmit]
 
-# --- Evaluation Engine (Layer 1 — Deterministic) ---
+# --- Evaluation Engine ---
 
-def evaluate_condition(condition: dict, user_input: str, ai_output: str) -> tuple[bool, str]:
+def evaluate_deterministic(condition: dict, user_input: str, ai_output: str) -> tuple[bool, str]:
     ctype = condition.get("type")
     text = ai_output.lower()
 
@@ -111,6 +116,44 @@ def evaluate_condition(condition: dict, user_input: str, ai_output: str) -> tupl
 
     return True, ""
 
+def evaluate_semantic(condition: dict, user_input: str, ai_output: str, policy_description: str) -> tuple[bool, str]:
+    if not ANTHROPIC_API_KEY:
+        return True, "Semantic evaluation skipped — no API key configured"
+
+    rule = condition.get("rule", policy_description)
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=200,
+            messages=[{
+                "role": "user",
+                "content": f"""You are a compliance evaluator. Evaluate whether the following AI interaction violates the given policy rule.
+
+Policy rule: {rule}
+
+User input: {user_input}
+
+AI output: {ai_output}
+
+Respond with ONLY a JSON object in this exact format:
+{{"passed": true, "reason": ""}}
+or
+{{"passed": false, "reason": "brief explanation of the violation"}}
+
+No other text. Just the JSON."""
+            }]
+        )
+
+        import json
+        response_text = message.content[0].text.strip()
+        result = json.loads(response_text)
+        return result.get("passed", True), result.get("reason", "")
+
+    except Exception as e:
+        return True, f"Semantic evaluation error: {str(e)}"
+
 def run_evaluation(interaction_id: str, user_input: str, ai_output: str) -> dict:
     with get_client() as client:
         r = client.get("/policies", params={"active": "eq.true", "select": "*"})
@@ -121,7 +164,12 @@ def run_evaluation(interaction_id: str, user_input: str, ai_output: str) -> dict
 
     for policy in policies:
         condition = policy.get("condition", {})
-        passed, reason = evaluate_condition(condition, user_input, ai_output)
+        ctype = condition.get("type", "")
+
+        if ctype == "semantic":
+            passed, reason = evaluate_semantic(condition, user_input, ai_output, policy.get("description", ""))
+        else:
+            passed, reason = evaluate_deterministic(condition, user_input, ai_output)
 
         with get_client() as client:
             client.post("/evaluations", json={
@@ -162,7 +210,7 @@ def run_evaluation(interaction_id: str, user_input: str, ai_output: str) -> dict
 def root():
     return {
         "tool": "PolicyThread",
-        "version": "0.1.0",
+        "version": "0.3.0",
         "status": "running",
         "description": "Define what your AI must always do and never do. PolicyThread watches every live interaction and tells you when it breaks the rules."
     }
@@ -220,7 +268,6 @@ def update_policy(policy_id: str, data: PolicyUpdate):
         raise HTTPException(status_code=404, detail="Policy not found")
     current = existing[0]
 
-    # Archive current version
     with get_client() as client:
         client.post("/policy_history", json={
             "policy_id": policy_id,
@@ -271,9 +318,7 @@ def evaluate_interaction(data: InteractionSubmit):
         })
     interaction = r.json()[0]
     interaction_id = interaction["id"]
-
     result = run_evaluation(interaction_id, data.user_input, data.ai_output)
-
     return {
         "interaction_id": interaction_id,
         "passed": result["passed"],
@@ -307,15 +352,14 @@ def evaluate_batch(data: BatchSubmit):
 @app.get("/violations")
 def list_violations(severity: Optional[str] = None, policy_id: Optional[str] = None, resolved: Optional[bool] = None):
     params = {"order": "created_at.desc"}
-    filters = []
     if severity:
-        filters.append(f"severity=eq.{severity}")
+        params["severity"] = f"eq.{severity}"
     if policy_id:
-        filters.append(f"policy_id=eq.{policy_id}")
+        params["policy_id"] = f"eq.{policy_id}"
     if resolved is not None:
-        filters.append(f"resolved=eq.{'true' if resolved else 'false'}")
+        params["resolved"] = f"eq.{'true' if resolved else 'false'}"
     with get_client() as client:
-        r = client.get("/violations", params={**params, **{f.split("=")[0]: f.split("=")[1] for f in filters}})
+        r = client.get("/violations", params=params)
     return r.json()
 
 @app.get("/violations/{violation_id}")
@@ -385,3 +429,58 @@ def dashboard_stats():
         "active_policies": len(policies.json()),
         "pass_rate": pass_rate
     }
+
+# Audit Report
+
+@app.get("/reports/audit")
+def audit_report(
+    start_date: Optional[str] = Query(None, description="ISO date e.g. 2026-01-01"),
+    end_date: Optional[str] = Query(None, description="ISO date e.g. 2026-12-31")
+):
+    params = {"order": "evaluated_at.desc"}
+    if start_date:
+        params["evaluated_at"] = f"gte.{start_date}"
+    if end_date:
+        params["evaluated_at"] = f"lte.{end_date}T23:59:59"
+
+    with get_client() as client:
+        interactions = client.get("/interactions", params=params).json()
+        violations = client.get("/violations", params={"order": "created_at.desc"}).json()
+
+    violations_by_interaction = {}
+    for v in violations:
+        iid = v["interaction_id"]
+        if iid not in violations_by_interaction:
+            violations_by_interaction[iid] = []
+        violations_by_interaction[iid].append(v)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "interaction_id", "session_id", "model_used", "evaluated_at",
+        "passed", "violation_count", "policy_names", "severities", "violation_reasons"
+    ])
+
+    for interaction in interactions:
+        iid = interaction["id"]
+        viols = violations_by_interaction.get(iid, [])
+        passed = len(viols) == 0
+        writer.writerow([
+            iid,
+            interaction.get("session_id", ""),
+            interaction.get("model_used", ""),
+            interaction.get("evaluated_at", ""),
+            passed,
+            len(viols),
+            " | ".join([v["policy_name"] for v in viols]),
+            " | ".join([v["severity"] for v in viols]),
+            " | ".join([v["violation_reason"] for v in viols])
+        ])
+
+    output.seek(0)
+    filename = f"policythread_audit_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
