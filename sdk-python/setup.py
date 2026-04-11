@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="policythread",
-    version="0.1.0",
+    version="0.3.0",
     description="Define what your AI must always do and never do. PolicyThread watches every live interaction and tells you when it breaks the rules.",
     author="Eugene Dayne Mawuli",
     author_email="bitelance.team@gmail.com",
