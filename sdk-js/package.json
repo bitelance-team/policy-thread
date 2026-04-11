@@ -1,6 +1,6 @@
 {
   "name": "policythread",
-  "version": "0.3.0",
+  "version": "0.7.0",
   "description": "Define what your AI must always do and never do. PolicyThread watches every live interaction and tells you when it breaks the rules.",
   "main": "index.js",
   "author": "Eugene Dayne Mawuli",
