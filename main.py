@@ -8,6 +8,8 @@ import os
 import re
 import csv
 import io
+import json
+import hashlib
 import anthropic
 from dotenv import load_dotenv
 from datetime import datetime
@@ -17,6 +19,8 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+CHAINTHREAD_URL = os.getenv("CHAINTHREAD_URL", "https://chain-thread.onrender.com")
+TESTTHREAD_URL = os.getenv("TESTTHREAD_URL", "https://test-thread-production.up.railway.app")
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -31,7 +35,7 @@ def get_client():
 app = FastAPI(
     title="PolicyThread",
     description="Define what your AI must always do and never do. PolicyThread watches every live interaction and tells you when it breaks the rules.",
-    version="0.3.0"
+    version="0.7.0"
 )
 
 app.add_middleware(
@@ -67,6 +71,51 @@ class InteractionSubmit(BaseModel):
 
 class BatchSubmit(BaseModel):
     interactions: List[InteractionSubmit]
+
+class WebhookCreate(BaseModel):
+    name: str
+    url: str
+    on_critical: Optional[bool] = True
+    on_high: Optional[bool] = True
+    on_medium: Optional[bool] = False
+    on_low: Optional[bool] = False
+
+class AlertConfigCreate(BaseModel):
+    policy_id: str
+    min_pass_rate: Optional[float] = 80.0
+    webhook_url: Optional[str] = None
+
+# --- Webhook Fire ---
+
+def fire_webhooks(violation: dict):
+    severity = violation.get("severity", "low")
+    severity_map = {
+        "critical": "on_critical",
+        "high": "on_high",
+        "medium": "on_medium",
+        "low": "on_low"
+    }
+    field = severity_map.get(severity, "on_low")
+
+    with get_client() as client:
+        r = client.get("/webhooks", params={"active": "eq.true", field: "eq.true"})
+        webhooks = r.json()
+
+    payload = {
+        "event": "policy.violation",
+        "policy_name": violation.get("policy_name"),
+        "severity": severity,
+        "violation_reason": violation.get("violation_reason"),
+        "interaction_id": violation.get("interaction_id"),
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+    for webhook in webhooks:
+        try:
+            with httpx.Client() as client:
+                client.post(webhook["url"], json=payload, timeout=5)
+        except Exception:
+            pass
 
 # --- Evaluation Engine ---
 
@@ -145,8 +194,6 @@ or
 No other text. Just the JSON."""
             }]
         )
-
-        import json
         response_text = message.content[0].text.strip()
         result = json.loads(response_text)
         return result.get("passed", True), result.get("reason", "")
@@ -182,7 +229,7 @@ def run_evaluation(interaction_id: str, user_input: str, ai_output: str) -> dict
         if not passed:
             all_passed = False
             with get_client() as client:
-                client.post("/violations", json={
+                vr = client.post("/violations", json={
                     "interaction_id": interaction_id,
                     "policy_id": policy["id"],
                     "policy_name": policy["name"],
@@ -190,6 +237,8 @@ def run_evaluation(interaction_id: str, user_input: str, ai_output: str) -> dict
                     "violation_reason": reason,
                     "on_violation": policy["on_violation"]
                 })
+            violation_record = vr.json()[0] if vr.json() else {}
+            fire_webhooks(violation_record)
 
             results.append({
                 "policy_id": policy["id"],
@@ -199,10 +248,7 @@ def run_evaluation(interaction_id: str, user_input: str, ai_output: str) -> dict
                 "reason": reason
             })
 
-    return {
-        "passed": all_passed,
-        "violations": results
-    }
+    return {"passed": all_passed, "violations": results}
 
 # --- Routes ---
 
@@ -210,7 +256,7 @@ def run_evaluation(interaction_id: str, user_input: str, ai_output: str) -> dict
 def root():
     return {
         "tool": "PolicyThread",
-        "version": "0.3.0",
+        "version": "0.7.0",
         "status": "running",
         "description": "Define what your AI must always do and never do. PolicyThread watches every live interaction and tells you when it breaks the rules."
     }
@@ -219,7 +265,7 @@ def root():
 def health():
     try:
         with get_client() as client:
-            r = client.get("/policies", params={"limit": "1"})
+            client.get("/policies", params={"limit": "1"})
         return {"status": "ok", "database": "connected"}
     except Exception as e:
         return {"status": "degraded", "error": str(e)}
@@ -430,12 +476,64 @@ def dashboard_stats():
         "pass_rate": pass_rate
     }
 
+# Analytics
+
+@app.get("/analytics/policies")
+def analytics_policies():
+    with get_client() as client:
+        policies = client.get("/policies", params={"active": "eq.true", "select": "*"}).json()
+        all_evaluations = client.get("/evaluations", params={"select": "*"}).json()
+
+    results = []
+    for policy in policies:
+        pid = policy["id"]
+        policy_evals = [e for e in all_evaluations if e["policy_id"] == pid]
+        total = len(policy_evals)
+        passed = len([e for e in policy_evals if e["passed"]])
+        failed = total - passed
+        pass_rate = round(100 * passed / total, 2) if total > 0 else 100.0
+        results.append({
+            "policy_id": pid,
+            "policy_name": policy["name"],
+            "severity": policy["severity"],
+            "total_evaluations": total,
+            "passed": passed,
+            "failed": failed,
+            "pass_rate": pass_rate
+        })
+
+    results.sort(key=lambda x: x["pass_rate"])
+    return {"policies": results}
+
+@app.get("/analytics/severity")
+def analytics_severity():
+    with get_client() as client:
+        violations = client.get("/violations", params={"select": "*", "order": "created_at.asc"}).json()
+
+    breakdown = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    by_date = {}
+
+    for v in violations:
+        sev = v.get("severity", "low")
+        breakdown[sev] = breakdown.get(sev, 0) + 1
+        date = v.get("created_at", "")[:10]
+        if date:
+            if date not in by_date:
+                by_date[date] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+            by_date[date][sev] = by_date[date].get(sev, 0) + 1
+
+    return {
+        "total_violations": len(violations),
+        "breakdown": breakdown,
+        "by_date": [{"date": d, **counts} for d, counts in sorted(by_date.items())]
+    }
+
 # Audit Report
 
 @app.get("/reports/audit")
 def audit_report(
-    start_date: Optional[str] = Query(None, description="ISO date e.g. 2026-01-01"),
-    end_date: Optional[str] = Query(None, description="ISO date e.g. 2026-12-31")
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None)
 ):
     params = {"order": "evaluated_at.desc"}
     if start_date:
@@ -484,3 +582,111 @@ def audit_report(
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
+# Webhooks
+
+@app.post("/webhooks")
+def create_webhook(data: WebhookCreate):
+    with get_client() as client:
+        r = client.post("/webhooks", json={
+            "name": data.name,
+            "url": data.url,
+            "on_critical": data.on_critical,
+            "on_high": data.on_high,
+            "on_medium": data.on_medium,
+            "on_low": data.on_low,
+            "active": True
+        })
+    return r.json()[0]
+
+@app.get("/webhooks")
+def list_webhooks():
+    with get_client() as client:
+        r = client.get("/webhooks", params={"order": "created_at.desc"})
+    return r.json()
+
+@app.delete("/webhooks/{webhook_id}")
+def deactivate_webhook(webhook_id: str):
+    with get_client() as client:
+        r = client.patch(f"/webhooks?id=eq.{webhook_id}", json={"active": False})
+    if not r.json():
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    return {"deactivated": True, "webhook_id": webhook_id}
+
+# Alert Configs
+
+@app.post("/alerts/config")
+def create_alert_config(data: AlertConfigCreate):
+    with get_client() as client:
+        r = client.post("/alert_configs", json={
+            "policy_id": data.policy_id,
+            "min_pass_rate": data.min_pass_rate,
+            "webhook_url": data.webhook_url,
+            "active": True
+        })
+    return r.json()[0]
+
+@app.get("/alerts/config/{policy_id}")
+def get_alert_config(policy_id: str):
+    with get_client() as client:
+        r = client.get("/alert_configs", params={"policy_id": f"eq.{policy_id}"})
+    data = r.json()
+    if not data:
+        raise HTTPException(status_code=404, detail="Alert config not found")
+    return data[0]
+
+# Thread Suite Bridge
+
+@app.get("/bridge/status")
+def bridge_status():
+    suite_status = {}
+    tools = {
+        "iron-thread": "https://iron-thread-production.up.railway.app/health",
+        "test-thread": f"{TESTTHREAD_URL}/health",
+        "prompt-thread": "https://prompt-thread.onrender.com/health",
+        "chain-thread": f"{CHAINTHREAD_URL}/health"
+    }
+    for name, url in tools.items():
+        try:
+            with httpx.Client() as client:
+                r = client.get(url, timeout=5)
+            suite_status[name] = "online" if r.status_code == 200 else "degraded"
+        except Exception:
+            suite_status[name] = "offline"
+
+    return {
+        "policy_thread": "online",
+        "suite": suite_status,
+        "urls": {
+            "iron-thread": "https://iron-thread-production.up.railway.app",
+            "test-thread": TESTTHREAD_URL,
+            "prompt-thread": "https://prompt-thread.onrender.com",
+            "chain-thread": CHAINTHREAD_URL,
+            "policy-thread": "https://policy-thread.onrender.com"
+        }
+    }
+
+@app.post("/bridge/chainthread")
+def bridge_chainthread(envelope_id: str, chain_id: str, sender_id: str, policy_ids: Optional[List[str]] = None):
+    with get_client() as client:
+        if policy_ids:
+            violations = client.get("/violations", params={
+                "interaction_id": f"eq.{envelope_id}",
+                "resolved": "eq.false"
+            }).json()
+        else:
+            violations = client.get("/violations", params={
+                "resolved": "eq.false",
+                "order": "created_at.desc",
+                "limit": "10"
+            }).json()
+
+    return {
+        "envelope_id": envelope_id,
+        "chain_id": chain_id,
+        "sender_id": sender_id,
+        "policy_violations_found": len(violations),
+        "violations": violations,
+        "chainthread_url": CHAINTHREAD_URL,
+        "message": f"PolicyThread found {len(violations)} unresolved violation(s) linked to this chain context."
+    }
