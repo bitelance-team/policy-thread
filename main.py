@@ -12,7 +12,7 @@ import json
 import hashlib
 import anthropic
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 
 load_dotenv()
 
@@ -35,7 +35,7 @@ def get_client():
 app = FastAPI(
     title="PolicyThread",
     description="Define what your AI must always do and never do. PolicyThread watches every live interaction and tells you when it breaks the rules.",
-    version="0.7.0"
+    version="1.3.0"
 )
 
 app.add_middleware(
@@ -69,6 +69,13 @@ class InteractionSubmit(BaseModel):
     model_used: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = {}
 
+class SessionEvaluate(BaseModel):
+    session_id: str
+    user_input: str
+    ai_output: str
+    model_used: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = {}
+
 class BatchSubmit(BaseModel):
     interactions: List[InteractionSubmit]
 
@@ -85,6 +92,33 @@ class AlertConfigCreate(BaseModel):
     min_pass_rate: Optional[float] = 80.0
     webhook_url: Optional[str] = None
 
+class EscalationRuleCreate(BaseModel):
+    policy_id: str
+    trigger_count: Optional[int] = 3
+    within_minutes: Optional[int] = 10
+    escalate_to: Optional[str] = "critical"
+    webhook_url: Optional[str] = None
+
+class SimulateRequest(BaseModel):
+    name: str
+    description: Optional[str] = None
+    condition: Dict[str, Any]
+    severity: str
+    on_violation: Optional[str] = "alert"
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+
+class ConflictCheckRequest(BaseModel):
+    condition: Dict[str, Any]
+    name: Optional[str] = "New Policy"
+
+class PolicyEnvelopeRequest(BaseModel):
+    chain_id: str
+    envelope_id: str
+    sender_id: str
+    receiver_id: str
+    session_id: Optional[str] = None
+
 # --- Webhook Fire ---
 
 def fire_webhooks(violation: dict):
@@ -96,11 +130,9 @@ def fire_webhooks(violation: dict):
         "low": "on_low"
     }
     field = severity_map.get(severity, "on_low")
-
     with get_client() as client:
         r = client.get("/webhooks", params={"active": "eq.true", field: "eq.true"})
         webhooks = r.json()
-
     payload = {
         "event": "policy.violation",
         "policy_name": violation.get("policy_name"),
@@ -109,13 +141,94 @@ def fire_webhooks(violation: dict):
         "interaction_id": violation.get("interaction_id"),
         "timestamp": datetime.utcnow().isoformat()
     }
-
     for webhook in webhooks:
         try:
             with httpx.Client() as client:
                 client.post(webhook["url"], json=payload, timeout=5)
         except Exception:
             pass
+
+def fire_escalation_webhook(url: str, policy_id: str, policy_name: str, trigger_count: int, within_minutes: int):
+    try:
+        with httpx.Client() as client:
+            client.post(url, json={
+                "event": "policy.escalated",
+                "policy_id": policy_id,
+                "policy_name": policy_name,
+                "message": f"Policy escalated to critical: fired {trigger_count} times in {within_minutes} minutes",
+                "timestamp": datetime.utcnow().isoformat()
+            }, timeout=5)
+    except Exception:
+        pass
+
+# --- Escalation Check (v0.8.0) ---
+
+def check_escalation(policy_id: str, policy_name: str):
+    with get_client() as client:
+        rules = client.get("/escalation_rules", params={
+            "policy_id": f"eq.{policy_id}",
+            "active": "eq.true"
+        }).json()
+
+    for rule in rules:
+        within_minutes = rule.get("within_minutes", 10)
+        trigger_count = rule.get("trigger_count", 3)
+        since = (datetime.utcnow() - timedelta(minutes=within_minutes)).isoformat()
+
+        with get_client() as client:
+            recent = client.get("/violations", params={
+                "policy_id": f"eq.{policy_id}",
+                "created_at": f"gte.{since}",
+                "select": "id"
+            }).json()
+
+        if len(recent) >= trigger_count:
+            with get_client() as client:
+                client.patch(f"/policies?id=eq.{policy_id}", json={
+                    "severity": rule.get("escalate_to", "critical"),
+                    "updated_at": datetime.utcnow().isoformat()
+                })
+            if rule.get("webhook_url"):
+                fire_escalation_webhook(
+                    rule["webhook_url"], policy_id, policy_name,
+                    trigger_count, within_minutes
+                )
+
+# --- Attestation (v0.9.0) ---
+
+def create_attestation(interaction_id: str, policy_id: str, policy_name: str, passed: bool):
+    with get_client() as client:
+        prev = client.get("/policy_attestations", params={
+            "policy_id": f"eq.{policy_id}",
+            "order": "created_at.desc",
+            "limit": "1"
+        }).json()
+
+    previous_hash = prev[0]["chain_hash"] if prev else "GENESIS"
+    now = datetime.utcnow().isoformat()
+
+    eval_data = json.dumps({
+        "interaction_id": interaction_id,
+        "policy_id": policy_id,
+        "policy_name": policy_name,
+        "passed": passed,
+        "timestamp": now
+    }, sort_keys=True)
+
+    evaluation_hash = hashlib.sha256(eval_data.encode()).hexdigest()
+    chain_input = f"{previous_hash}:{evaluation_hash}"
+    chain_hash = hashlib.sha256(chain_input.encode()).hexdigest()
+
+    with get_client() as client:
+        client.post("/policy_attestations", json={
+            "interaction_id": interaction_id,
+            "policy_id": policy_id,
+            "policy_name": policy_name,
+            "passed": passed,
+            "evaluation_hash": evaluation_hash,
+            "previous_hash": previous_hash,
+            "chain_hash": chain_hash
+        })
 
 # --- Evaluation Engine ---
 
@@ -165,11 +278,16 @@ def evaluate_deterministic(condition: dict, user_input: str, ai_output: str) -> 
 
     return True, ""
 
-def evaluate_semantic(condition: dict, user_input: str, ai_output: str, policy_description: str) -> tuple[bool, str]:
+def evaluate_semantic(condition: dict, user_input: str, ai_output: str, policy_description: str, context: Optional[List[dict]] = None) -> tuple[bool, str]:
     if not ANTHROPIC_API_KEY:
         return True, "Semantic evaluation skipped — no API key configured"
 
     rule = condition.get("rule", policy_description)
+    context_block = ""
+    if context:
+        context_block = "\n\nPrior conversation context:\n"
+        for c in context[-5:]:
+            context_block += f"User: {c.get('user_input', '')}\nAI: {c.get('ai_output', '')}\n"
 
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -180,7 +298,7 @@ def evaluate_semantic(condition: dict, user_input: str, ai_output: str, policy_d
                 "role": "user",
                 "content": f"""You are a compliance evaluator. Evaluate whether the following AI interaction violates the given policy rule.
 
-Policy rule: {rule}
+Policy rule: {rule}{context_block}
 
 User input: {user_input}
 
@@ -197,11 +315,10 @@ No other text. Just the JSON."""
         response_text = message.content[0].text.strip()
         result = json.loads(response_text)
         return result.get("passed", True), result.get("reason", "")
-
     except Exception as e:
         return True, f"Semantic evaluation error: {str(e)}"
 
-def run_evaluation(interaction_id: str, user_input: str, ai_output: str) -> dict:
+def run_evaluation(interaction_id: str, user_input: str, ai_output: str, context: Optional[List[dict]] = None) -> dict:
     with get_client() as client:
         r = client.get("/policies", params={"active": "eq.true", "select": "*"})
         policies = r.json()
@@ -214,7 +331,7 @@ def run_evaluation(interaction_id: str, user_input: str, ai_output: str) -> dict
         ctype = condition.get("type", "")
 
         if ctype == "semantic":
-            passed, reason = evaluate_semantic(condition, user_input, ai_output, policy.get("description", ""))
+            passed, reason = evaluate_semantic(condition, user_input, ai_output, policy.get("description", ""), context)
         else:
             passed, reason = evaluate_deterministic(condition, user_input, ai_output)
 
@@ -225,6 +342,8 @@ def run_evaluation(interaction_id: str, user_input: str, ai_output: str) -> dict
                 "passed": passed,
                 "violation_reason": reason if not passed else None
             })
+
+        create_attestation(interaction_id, policy["id"], policy["name"], passed)
 
         if not passed:
             all_passed = False
@@ -239,6 +358,7 @@ def run_evaluation(interaction_id: str, user_input: str, ai_output: str) -> dict
                 })
             violation_record = vr.json()[0] if vr.json() else {}
             fire_webhooks(violation_record)
+            check_escalation(policy["id"], policy["name"])
 
             results.append({
                 "policy_id": policy["id"],
@@ -250,13 +370,79 @@ def run_evaluation(interaction_id: str, user_input: str, ai_output: str) -> dict
 
     return {"passed": all_passed, "violations": results}
 
+# --- Conflict Detection (v1.1.0) ---
+
+def detect_conflicts(new_condition: dict, new_name: str, exclude_id: Optional[str] = None) -> List[dict]:
+    with get_client() as client:
+        policies = client.get("/policies", params={"active": "eq.true", "select": "*"}).json()
+
+    conflicts = []
+    new_type = new_condition.get("type", "")
+    new_keywords = set(k.lower() for k in new_condition.get("keywords", []))
+
+    for policy in policies:
+        if exclude_id and policy["id"] == exclude_id:
+            continue
+
+        existing_condition = policy.get("condition", {})
+        existing_type = existing_condition.get("type", "")
+        existing_keywords = set(k.lower() for k in existing_condition.get("keywords", []))
+
+        conflict = None
+
+        if new_type == "keyword_require" and existing_type == "keyword_exclude":
+            overlap = new_keywords & existing_keywords
+            if overlap:
+                conflict = {
+                    "conflicting_policy_id": policy["id"],
+                    "conflicting_policy_name": policy["name"],
+                    "conflict_type": "require_exclude_overlap",
+                    "explanation": f"'{new_name}' requires keywords {overlap} but '{policy['name']}' excludes them. Both cannot be satisfied simultaneously."
+                }
+
+        elif new_type == "keyword_exclude" and existing_type == "keyword_require":
+            overlap = new_keywords & existing_keywords
+            if overlap:
+                conflict = {
+                    "conflicting_policy_id": policy["id"],
+                    "conflicting_policy_name": policy["name"],
+                    "conflict_type": "exclude_require_overlap",
+                    "explanation": f"'{new_name}' excludes keywords {overlap} but '{policy['name']}' requires them. Both cannot be satisfied simultaneously."
+                }
+
+        elif new_type == "max_length" and existing_type == "keyword_require":
+            max_len = new_condition.get("max_length", 1000)
+            required = existing_condition.get("keywords", [])
+            if max_len < 50 and required:
+                conflict = {
+                    "conflicting_policy_id": policy["id"],
+                    "conflicting_policy_name": policy["name"],
+                    "conflict_type": "length_keyword_tension",
+                    "explanation": f"'{new_name}' restricts output to {max_len} characters but '{policy['name']}' requires specific keywords that may need more space."
+                }
+
+        elif new_type == existing_type == "keyword_exclude":
+            overlap = new_keywords & existing_keywords
+            if overlap:
+                conflict = {
+                    "conflicting_policy_id": policy["id"],
+                    "conflicting_policy_name": policy["name"],
+                    "conflict_type": "duplicate_exclusion",
+                    "explanation": f"'{new_name}' and '{policy['name']}' both exclude keywords {overlap}. Consider consolidating into one policy."
+                }
+
+        if conflict:
+            conflicts.append(conflict)
+
+    return conflicts
+
 # --- Routes ---
 
 @app.get("/")
 def root():
     return {
         "tool": "PolicyThread",
-        "version": "0.7.0",
+        "version": "1.3.0",
         "status": "running",
         "description": "Define what your AI must always do and never do. PolicyThread watches every live interaction and tells you when it breaks the rules."
     }
@@ -278,6 +464,9 @@ def create_policy(data: PolicyCreate):
         raise HTTPException(status_code=400, detail="severity must be critical, high, medium, or low")
     if data.on_violation not in ("block", "alert", "log_only"):
         raise HTTPException(status_code=400, detail="on_violation must be block, alert, or log_only")
+
+    conflicts = detect_conflicts(data.condition, data.name)
+
     with get_client() as client:
         r = client.post("/policies", json={
             "name": data.name,
@@ -288,7 +477,9 @@ def create_policy(data: PolicyCreate):
             "active": True,
             "version": 1
         })
-    return r.json()[0]
+    policy = r.json()[0]
+    policy["conflicts_detected"] = conflicts
+    return policy
 
 @app.get("/policies")
 def list_policies():
@@ -329,9 +520,15 @@ def update_policy(policy_id: str, data: PolicyUpdate):
     updates["version"] = current["version"] + 1
     updates["updated_at"] = datetime.utcnow().isoformat()
 
+    conflicts = []
+    if "condition" in updates:
+        conflicts = detect_conflicts(updates["condition"], current["name"], exclude_id=policy_id)
+
     with get_client() as client:
         r = client.patch(f"/policies?id=eq.{policy_id}", json=updates)
-    return r.json()[0]
+    policy = r.json()[0]
+    policy["conflicts_detected"] = conflicts
+    return policy
 
 @app.delete("/policies/{policy_id}")
 def deactivate_policy(policy_id: str):
@@ -348,6 +545,97 @@ def get_policy_history(policy_id: str):
             "policy_id": f"eq.{policy_id}",
             "order": "version.desc"
         })
+    return r.json()
+
+@app.post("/policies/simulate")
+def simulate_policy(data: SimulateRequest):
+    params = {"order": "evaluated_at.desc"}
+    if data.start_date:
+        params["evaluated_at"] = f"gte.{data.start_date}"
+    if data.end_date:
+        params["evaluated_at"] = f"lte.{data.end_date}T23:59:59"
+
+    with get_client() as client:
+        interactions = client.get("/interactions", params=params).json()
+
+    would_violate = []
+    would_pass = []
+
+    for interaction in interactions:
+        ctype = data.condition.get("type", "")
+        if ctype == "semantic":
+            passed, reason = evaluate_semantic(
+                data.condition,
+                interaction.get("user_input", ""),
+                interaction.get("ai_output", ""),
+                data.description or ""
+            )
+        else:
+            passed, reason = evaluate_deterministic(
+                data.condition,
+                interaction.get("user_input", ""),
+                interaction.get("ai_output", "")
+            )
+
+        entry = {
+            "interaction_id": interaction["id"],
+            "session_id": interaction.get("session_id"),
+            "evaluated_at": interaction.get("evaluated_at"),
+            "user_input_preview": interaction.get("user_input", "")[:100],
+            "ai_output_preview": interaction.get("ai_output", "")[:100],
+        }
+
+        if not passed:
+            entry["violation_reason"] = reason
+            would_violate.append(entry)
+        else:
+            would_pass.append(entry)
+
+    total = len(interactions)
+    return {
+        "simulation_only": True,
+        "nothing_logged": True,
+        "policy_name": data.name,
+        "severity": data.severity,
+        "total_interactions_tested": total,
+        "would_violate_count": len(would_violate),
+        "would_pass_count": len(would_pass),
+        "violation_rate": round(100 * len(would_violate) / total, 2) if total > 0 else 0.0,
+        "would_violate": would_violate,
+        "would_pass": would_pass
+    }
+
+@app.post("/policies/conflict-check")
+def conflict_check(data: ConflictCheckRequest):
+    conflicts = detect_conflicts(data.condition, data.name)
+    return {
+        "policy_name": data.name,
+        "conflicts_found": len(conflicts),
+        "has_conflicts": len(conflicts) > 0,
+        "conflicts": conflicts
+    }
+
+# Escalation Rules
+
+@app.post("/escalation-rules")
+def create_escalation_rule(data: EscalationRuleCreate):
+    if data.escalate_to not in ("critical", "high", "medium", "low"):
+        raise HTTPException(status_code=400, detail="escalate_to must be a valid severity level")
+    with get_client() as client:
+        r = client.post("/escalation_rules", json={
+            "policy_id": data.policy_id,
+            "trigger_count": data.trigger_count,
+            "within_minutes": data.within_minutes,
+            "escalate_to": data.escalate_to,
+            "webhook_url": data.webhook_url,
+            "active": True
+        })
+    return r.json()[0]
+
+@app.get("/escalation-rules/{policy_id}")
+def get_escalation_rules(policy_id: str):
+    with get_client() as client:
+        r = client.get("/escalation_rules", params={"policy_id": f"eq.{policy_id}"})
     return r.json()
 
 # Evaluate
@@ -392,6 +680,40 @@ def evaluate_batch(data: BatchSubmit):
             "violations": result["violations"]
         })
     return {"results": results, "total": len(results)}
+
+@app.post("/evaluate/session")
+def evaluate_session(data: SessionEvaluate):
+    with get_client() as client:
+        prior = client.get("/interactions", params={
+            "session_id": f"eq.{data.session_id}",
+            "order": "evaluated_at.asc",
+            "limit": "10"
+        }).json()
+
+    context = [
+        {"user_input": p.get("user_input", ""), "ai_output": p.get("ai_output", "")}
+        for p in prior
+    ]
+
+    with get_client() as client:
+        r = client.post("/interactions", json={
+            "user_input": data.user_input,
+            "ai_output": data.ai_output,
+            "session_id": data.session_id,
+            "model_used": data.model_used,
+            "metadata": data.metadata
+        })
+    interaction = r.json()[0]
+    interaction_id = interaction["id"]
+
+    result = run_evaluation(interaction_id, data.user_input, data.ai_output, context=context)
+    return {
+        "interaction_id": interaction_id,
+        "session_id": data.session_id,
+        "prior_turns_used": len(context),
+        "passed": result["passed"],
+        "violations": result["violations"]
+    }
 
 # Violations
 
@@ -635,6 +957,40 @@ def get_alert_config(policy_id: str):
         raise HTTPException(status_code=404, detail="Alert config not found")
     return data[0]
 
+# Attestations
+
+@app.get("/attestations/{interaction_id}")
+def get_attestations(interaction_id: str):
+    with get_client() as client:
+        r = client.get("/policy_attestations", params={
+            "interaction_id": f"eq.{interaction_id}",
+            "order": "created_at.asc"
+        })
+    return r.json()
+
+@app.get("/attestations/chain/{policy_id}")
+def get_attestation_chain(policy_id: str):
+    with get_client() as client:
+        r = client.get("/policy_attestations", params={
+            "policy_id": f"eq.{policy_id}",
+            "order": "created_at.asc"
+        })
+    chain = r.json()
+
+    verified = True
+    for i, record in enumerate(chain):
+        expected_previous = chain[i-1]["chain_hash"] if i > 0 else "GENESIS"
+        if record.get("previous_hash") != expected_previous:
+            verified = False
+            break
+
+    return {
+        "policy_id": policy_id,
+        "chain_length": len(chain),
+        "chain_verified": verified,
+        "attestations": chain
+    }
+
 # Thread Suite Bridge
 
 @app.get("/bridge/status")
@@ -669,17 +1025,11 @@ def bridge_status():
 @app.post("/bridge/chainthread")
 def bridge_chainthread(envelope_id: str, chain_id: str, sender_id: str, policy_ids: Optional[List[str]] = None):
     with get_client() as client:
-        if policy_ids:
-            violations = client.get("/violations", params={
-                "interaction_id": f"eq.{envelope_id}",
-                "resolved": "eq.false"
-            }).json()
-        else:
-            violations = client.get("/violations", params={
-                "resolved": "eq.false",
-                "order": "created_at.desc",
-                "limit": "10"
-            }).json()
+        violations = client.get("/violations", params={
+            "resolved": "eq.false",
+            "order": "created_at.desc",
+            "limit": "10"
+        }).json()
 
     return {
         "envelope_id": envelope_id,
@@ -689,4 +1039,61 @@ def bridge_chainthread(envelope_id: str, chain_id: str, sender_id: str, policy_i
         "violations": violations,
         "chainthread_url": CHAINTHREAD_URL,
         "message": f"PolicyThread found {len(violations)} unresolved violation(s) linked to this chain context."
+    }
+
+@app.post("/bridge/chainthread/policy-envelope")
+def policy_envelope(data: PolicyEnvelopeRequest):
+    with get_client() as client:
+        policies = client.get("/policies", params={"active": "eq.true", "select": "*"}).json()
+
+    active_policy_snapshot = [
+        {
+            "policy_id": p["id"],
+            "name": p["name"],
+            "severity": p["severity"],
+            "on_violation": p["on_violation"],
+            "condition_type": p.get("condition", {}).get("type", "unknown")
+        }
+        for p in policies
+    ]
+
+    envelope_hash = hashlib.sha256(json.dumps({
+        "chain_id": data.chain_id,
+        "envelope_id": data.envelope_id,
+        "sender_id": data.sender_id,
+        "policy_count": len(active_policy_snapshot),
+        "timestamp": datetime.utcnow().isoformat()
+    }, sort_keys=True).encode()).hexdigest()
+
+    session_violations = []
+    if data.session_id:
+        with get_client() as client:
+            session_interactions = client.get("/interactions", params={
+                "session_id": f"eq.{data.session_id}",
+                "select": "id"
+            }).json()
+        interaction_ids = [i["id"] for i in session_interactions]
+        for iid in interaction_ids:
+            with get_client() as client:
+                viols = client.get("/violations", params={
+                    "interaction_id": f"eq.{iid}",
+                    "resolved": "eq.false",
+                    "select": "policy_name,severity,violation_reason"
+                }).json()
+            session_violations.extend(viols)
+
+    return {
+        "policy_envelope": {
+            "chain_id": data.chain_id,
+            "envelope_id": data.envelope_id,
+            "sender_id": data.sender_id,
+            "receiver_id": data.receiver_id,
+            "active_policies": active_policy_snapshot,
+            "policy_count": len(active_policy_snapshot),
+            "envelope_hash": envelope_hash,
+            "session_violations": session_violations,
+            "session_violation_count": len(session_violations),
+            "generated_at": datetime.utcnow().isoformat()
+        },
+        "message": "Policy envelope generated. Attach to ChainThread handoff payload for inherited compliance context."
     }
