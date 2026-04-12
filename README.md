@@ -1,22 +1,22 @@
 # PolicyThread
 
-**Define what your AI must always do and never do. PolicyThread watches every 
+**Define what your AI must always do and never do. PolicyThread watches every
 live interaction and tells you when it breaks the rules.**
 
-Part of the [Thread Suite](https://github.com/eugene001dayne) — the reliability 
+Part of the [Thread Suite](https://github.com/eugene001dayne) — the reliability
 layer for AI agents.
 
 ---
 
 ## The Problem
 
-Organizations deploying AI in production have rules. Legal rules. Brand rules. 
-Safety rules. Compliance rules. Right now enforcing those rules is manual and 
-reactive — someone writes a system prompt, hopes for the best, and finds out the 
+Organizations deploying AI in production have rules. Legal rules. Brand rules.
+Safety rules. Compliance rules. Right now enforcing those rules is manual and
+reactive — someone writes a system prompt, hopes for the best, and finds out the
 AI broke the rules when a customer complains or a regulator asks.
 
-There is no always-on layer watching every AI interaction against a defined 
-policy. No alert when the AI violates a rule. No audit trail proving the 
+There is no always-on layer watching every AI interaction against a defined
+policy. No alert when the AI violates a rule. No audit trail proving the
 organization tried.
 
 PolicyThread fixes this.
@@ -25,12 +25,15 @@ PolicyThread fixes this.
 
 ## What It Does
 
-- Write policies in plain language: *"Never recommend a competitor"*, 
+- Write policies in plain language: *"Never recommend a competitor"*,
   *"Always include a disclaimer on financial advice"*
 - Submit every AI interaction via API
 - PolicyThread evaluates against all active policies instantly
 - Violations are logged, alerts fire, dashboard updates in real time
 - Download a full audit trail for any date range — one click
+- Every evaluation generates a cryptographically chained attestation record
+- Dry-run any policy against historical data before activating it
+- Session-aware evaluation catches violations that only appear in context
 
 ---
 
@@ -55,7 +58,7 @@ from policythread import PolicyThread
 
 pt = PolicyThread()
 
-# Create a policy
+# Create a deterministic policy
 pt.create_policy(
     name="No competitor mentions",
     description="AI output must never reference competitor products",
@@ -67,10 +70,22 @@ pt.create_policy(
     on_violation="alert"
 )
 
+# Create a semantic policy — Claude judges the output
+pt.create_policy(
+    name="No medical advice",
+    description="AI must never provide specific medical diagnoses",
+    condition={
+        "type": "semantic",
+        "rule": "The AI must not provide specific medical diagnoses or recommend specific treatments or medications"
+    },
+    severity="critical",
+    on_violation="block"
+)
+
 # Evaluate an interaction
 result = pt.evaluate(
     user_input="Which product should I use?",
-    ai_output="You should try CompetitorA, it's better for your use case.",
+    ai_output="You should try CompetitorA, it is better for your use case.",
     model_used="gpt-4o",
     session_id="session-123"
 )
@@ -112,7 +127,7 @@ if (!result.passed) {
 | `regex_require` | Output must match this pattern |
 | `max_length` | Output must not exceed N characters |
 | `input_keyword_exclude` | User input must not contain these words |
-| `semantic` | AI judges whether the output violates the rule |
+| `semantic` | Claude judges whether the output violates the rule |
 
 ---
 
@@ -127,80 +142,110 @@ if (!result.passed) {
 
 ---
 
-## API Endpoints
+## Policy Simulation
 
-```
-GET    /                              Status + version
-GET    /health                        Health check
+Test any policy against your historical interactions before activating it.
+Nothing is logged. Dry-run only.
 
-POST   /policies                      Create a policy
-GET    /policies                      List all active policies
-GET    /policies/{id}                 Get policy by ID
-PUT    /policies/{id}                 Update policy (auto-versions)
-DELETE /policies/{id}                 Deactivate policy
-GET    /policies/{id}/history         Get all previous versions
-
-POST   /evaluate                      Evaluate one interaction
-POST   /evaluate/batch                Evaluate multiple interactions
-
-GET    /violations                    List violations (filterable)
-GET    /violations/{id}               Get single violation
-PATCH  /violations/{id}/resolve       Mark violation resolved
-
-GET    /interactions                  List evaluated interactions
-GET    /interactions/{id}             Get interaction with evaluations
-
-GET    /dashboard/stats               Overview stats
-GET    /analytics/policies            Per-policy violation rates
-GET    /analytics/severity            Violation breakdown by severity
-
-GET    /reports/audit                 Download audit report (CSV)
-
-POST   /webhooks                      Create webhook
-GET    /webhooks                      List webhooks
-DELETE /webhooks/{id}                 Deactivate webhook
-
-POST   /alerts/config                 Create alert config
-GET    /alerts/config/{policy_id}     Get alert config
-
-GET    /bridge/status                 Thread Suite health check
-POST   /bridge/chainthread            Link violation to ChainThread handoff
-```
-
----
-
-## Semantic Evaluation
-
-For rules requiring judgment, set `"type": "semantic"` in the condition:
-
-```json
+```python
+POST /policies/simulate
 {
-  "name": "No medical advice",
+  "name": "No financial advice",
   "condition": {
     "type": "semantic",
-    "rule": "The AI must not provide specific medical diagnoses or 
-             recommend specific treatments or medications"
+    "rule": "The AI must not provide specific investment recommendations"
   },
   "severity": "critical",
   "on_violation": "block"
 }
 ```
 
-PolicyThread sends the interaction to Claude and gets a binary pass/fail 
-with a plain-language reason. No manual rule writing for complex judgments.
+Returns: `would_violate_count`, `would_pass_count`, `violation_rate`, full list
+of which historical interactions would have been flagged.
 
 ---
 
-## Audit Reports
+## Session-Aware Evaluation
+
+Standard evaluation checks each interaction in isolation. Session evaluation
+passes the full prior conversation context to the semantic layer — catching
+violations that only appear when you know what was said earlier.
 
 ```python
-# Download via SDK
-# Or hit directly:
-GET /reports/audit?start_date=2026-01-01&end_date=2026-12-31
+POST /evaluate/session
+{
+  "session_id": "session-123",
+  "user_input": "OK do it",
+  "ai_output": "I will proceed with the investment.",
+  "model_used": "gpt-4o"
+}
 ```
 
-Returns a CSV with every interaction, every violation, every policy active 
-during the period. One file. Hand it to a regulator.
+Returns `prior_turns_used` so you know how much context was applied.
+
+---
+
+## Conflict Detection
+
+Every time you create or update a policy, PolicyThread automatically checks
+for conflicts with all existing active policies. A policy that requires a
+keyword another policy excludes will be flagged before it causes problems.
+
+```json
+{
+  "conflicts_found": 1,
+  "has_conflicts": true,
+  "conflicts": [{
+    "conflict_type": "require_exclude_overlap",
+    "explanation": "'Must mention CompetitorA' requires keywords {'competitora'}
+                    but 'No competitor mentions' excludes them. Both cannot be
+                    satisfied simultaneously."
+  }]
+}
+```
+
+Run standalone: `POST /policies/conflict-check`
+
+---
+
+## Adaptive Escalation
+
+When a policy fires repeatedly in a short window, escalate automatically.
+
+```python
+POST /escalation-rules
+{
+  "policy_id": "...",
+  "trigger_count": 3,
+  "within_minutes": 10,
+  "escalate_to": "critical",
+  "webhook_url": "https://hooks.slack.com/your-webhook"
+}
+```
+
+If the policy fires 3 times in 10 minutes, severity escalates to critical and
+your webhook fires immediately.
+
+---
+
+## Attestation Chain
+
+Every evaluation — pass or fail — generates a SHA-256 signed attestation record
+chained to the previous. The chain is mathematically verifiable. Any tampering
+breaks it.
+
+```python
+GET /attestations/chain/{policy_id}
+
+{
+  "chain_length": 47,
+  "chain_verified": true,
+  "attestations": [...]
+}
+```
+
+Hand the chain to a regulator. It proves every evaluation happened, in order,
+and was never modified.
 
 ---
 
@@ -217,8 +262,71 @@ pt.create_webhook(
 )
 ```
 
-Fires a POST to your URL the moment a violation occurs. Works with Slack, 
-PagerDuty, or any URL that accepts POST.
+Fires a POST the moment a violation occurs. Works with Slack, PagerDuty, or
+any URL that accepts POST.
+
+---
+
+## Audit Reports
+
+```
+GET /reports/audit?start_date=2026-01-01&end_date=2026-12-31
+```
+
+Returns a CSV with every interaction evaluated, every violation logged, every
+policy active during the period. One file. Hand it to a regulator or a board.
+
+---
+
+## API Endpoints
+
+```
+GET    /                                     Status + version
+GET    /health                               Health check
+
+POST   /policies                             Create policy (auto conflict check)
+GET    /policies                             List all active policies
+GET    /policies/{id}                        Get policy by ID
+PUT    /policies/{id}                        Update policy (auto-versions)
+DELETE /policies/{id}                        Deactivate policy
+GET    /policies/{id}/history                Get all previous versions
+POST   /policies/simulate                    Dry-run policy against history
+POST   /policies/conflict-check              Check for policy conflicts
+
+POST   /escalation-rules                     Create escalation rule
+GET    /escalation-rules/{policy_id}         Get escalation rules for a policy
+
+POST   /evaluate                             Evaluate one interaction
+POST   /evaluate/batch                       Evaluate multiple interactions
+POST   /evaluate/session                     Evaluate with session context
+
+GET    /violations                           List violations (filterable)
+GET    /violations/{id}                      Get single violation
+PATCH  /violations/{id}/resolve              Mark violation resolved
+
+GET    /interactions                         List evaluated interactions
+GET    /interactions/{id}                    Get interaction with evaluations
+
+GET    /dashboard/stats                      Overview stats
+GET    /analytics/policies                   Per-policy violation rates
+GET    /analytics/severity                   Violation breakdown by severity
+
+GET    /reports/audit                        Download audit report CSV
+
+POST   /webhooks                             Create webhook
+GET    /webhooks                             List webhooks
+DELETE /webhooks/{id}                        Deactivate webhook
+
+POST   /alerts/config                        Create alert config
+GET    /alerts/config/{policy_id}            Get alert config
+
+GET    /attestations/{interaction_id}        Attestations for an interaction
+GET    /attestations/chain/{policy_id}       Full verified attestation chain
+
+GET    /bridge/status                        Thread Suite health check
+POST   /bridge/chainthread                   Link violations to ChainThread
+POST   /bridge/chainthread/policy-envelope   Generate policy envelope for handoff
+```
 
 ---
 
@@ -231,6 +339,11 @@ PromptThread  → Is my prompt performing well over time?
 ChainThread   → Did the handoff between agents succeed?
 PolicyThread  → Is the AI staying within the rules in production?
 ```
+
+When a ChainThread handoff occurs, `POST /bridge/chainthread/policy-envelope`
+generates a signed snapshot of all active compliance policies that travels with
+the handoff. The receiving agent knows exactly what rules the sender was
+operating under.
 
 ---
 
@@ -247,5 +360,5 @@ python -m uvicorn main:app --reload
 
 ---
 
-Built by [Eugene Dayne Mawuli](https://github.com/eugene001dayne)  
+Built by [Eugene Dayne Mawuli](https://github.com/eugene001dayne)
 *"Built for the age of AI agents."*
