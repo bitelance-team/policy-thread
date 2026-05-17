@@ -360,5 +360,33 @@ python -m uvicorn main:app --reload
 
 ---
 
+---
+
+## PolicyGuard — Enterprise AI Firewall (Hackathon Demo)
+
+Built for the Enterprise AI Hackathon | Track 1: Agent Security & AI Governance
+
+A Streamlit app that demonstrates PolicyThread as an enterprise AI firewall. Three capabilities in one interface:
+
+**1. Live Attack Simulator** — Test prompts against real-time security policies. See exactly what gets blocked, why, and with what severity. Pre-loaded with prompt injection attempts and compliance violations across four agent types.
+
+**2. Declared vs Detected Intent** — Define what your agent is supposed to do. Submit its actual response. Catches when agent behavior deviates from its declared purpose.
+
+**3. Regulator-Ready Audit Trail** — PolicyThread's cryptographic attestation chain formatted as a compliance report. Tamper-evident. SHA-256 hash chaining. Suitable for regulatory submission.
+
+### Run the demo
+
+```bash
+pip install streamlit httpx
+streamlit run app.py
+```
+
+### Live demo
+[Streamlit URL — add after deployment]
+
+Built by Eugene Dayne Mawuli | BiteLance
+
+---
+
 Built by [Eugene Dayne Mawuli](https://github.com/eugene001dayne)
 *"Built for the age of AI agents."*
