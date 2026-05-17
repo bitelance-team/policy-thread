@@ -55,7 +55,7 @@ def get_policies_for_agent_type(agent_type):
             {
                 "name": "No prompt injection",
                 "description": "Block attempts to override agent instructions",
-                "condition": {"type": "keyword_exclude", "keywords": ["ignore previous", "system prompt", "jailbreak", "override instructions", "ignore your instructions", "disregard your"]},
+                "condition": {"type": "input_keyword_exclude", "keywords": ["ignore previous", "system prompt", "jailbreak", "override instructions", "ignore your instructions", "disregard your"]},
                 "severity": "critical",
                 "on_violation": "block"
             },
@@ -289,6 +289,12 @@ if not st.session_state.server_ready:
     ok = wake_server()
     if ok:
         st.session_state.server_ready = True
+        # Clean up any leftover PolicyGuard policies from previous sessions
+        existing = api_call("GET", "/policies")
+        if existing:
+            stale = [p["id"] for p in existing if "policyguard" in p.get("name", "").lower() or p.get("name", "").startswith("Intent alignment check")]
+            for pid in stale:
+                api_call("DELETE", f"/policies/{pid}")
         st.success("✅ PolicyThread connected")
     else:
         st.error("❌ Could not connect to PolicyThread. Please refresh the page.")
@@ -343,11 +349,11 @@ with tab1:
         for ex in attack_examples:
             if st.button(ex[:60] + ("..." if len(ex) > 60 else ""), key=f"ex_{ex[:20]}"):
                 st.session_state["attack_prompt_prefill"] = ex
+                st.rerun()
 
-        prompt_value = st.session_state.get("attack_prompt_prefill", "")
         user_prompt = st.text_area(
             "Enter a prompt to test",
-            value=prompt_value,
+            value=st.session_state.get("attack_prompt_prefill", ""),
             height=100,
             placeholder="Type a prompt or click an example above...",
             key="attack_prompt_input"
