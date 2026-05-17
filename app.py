@@ -349,6 +349,8 @@ with tab1:
         for ex in attack_examples:
             if st.button(ex[:60] + ("..." if len(ex) > 60 else ""), key=f"ex_{ex[:20]}"):
                 st.session_state["attack_prompt_prefill"] = ex
+                if "attack_prompt_input" in st.session_state:
+                    del st.session_state["attack_prompt_input"]
                 st.rerun()
 
         user_prompt = st.text_area(
@@ -366,6 +368,15 @@ with tab1:
             if not user_prompt.strip():
                 st.warning("Please enter a prompt to test.")
             else:
+                # Clean up any stale policies first
+                with st.spinner("Clearing previous session policies..."):
+                    existing = api_call("GET", "/policies")
+                    if existing:
+                        for p in existing:
+                            name = p.get("name", "")
+                            if any(kw in name for kw in ["No prompt injection", "No confidential", "No unauthorized", "No specific medication", "No specific diagnoses", "No medical guarantees", "No guaranteed returns", "No specific securities", "No risk-free language", "No specific legal", "Must recommend attorney", "No guaranteed outcomes"]):
+                                api_call("DELETE", f"/policies/{p['id']}")
+
                 # Create policies
                 with st.spinner(f"Loading {agent_type} security policies..."):
                     policy_ids = create_policies_for_agent_type(agent_type)
